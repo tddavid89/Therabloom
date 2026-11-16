@@ -1,6 +1,0 @@
-{
-  "summary":  "Implementation plan for SimplePractice calendar and email summary integration, enabling calendar invite imports (.ics), calendar feed subscription sync, and email invite/summary parsing.",
-  "updatedAt":  "2026-11-10T20:20:33.390115191Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}
