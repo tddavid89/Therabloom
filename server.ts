@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI } from '@google/genai';
+import { AsyncLocalStorage } from 'async_hooks';
 
 dotenv.config();
 
@@ -13,35 +13,390 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '10mb' }));
+app.use((req, _res, next) => {
+  const quality = req.body?.quality === 'deep' ? 'deep' : 'fast';
+  requestQuality.run({ quality }, () => next());
+});
 
-// Dynamic Server-side Gemini Client
-function getValidGeminiClient(): GoogleGenAI | null {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key || typeof key !== 'string' || key.trim() === '' || key === 'MY_GEMINI_API_KEY') {
-    return null;
+// ---------------------------------------------------------------------------
+// Provider setup
+// - Journal chat uses Gemini 3.8 Flash on the Google AI Studio FREE tier.
+// - All other AI features continue to use local Ollama so stored counseling
+//   notes, session summaries, resource notes, and session-prep data are not
+//   sent to the hosted Gemini API by those endpoints.
+// - Keep the Google Cloud project on the Free tier with NO billing account
+//   linked. This code never selects a paid model, retries, or uses grounding.
+// ---------------------------------------------------------------------------
+const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://127.0.0.1:11434').replace(/\/$/, '');
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'soma-gemma-test';
+const OLLAMA_MODEL_DEEP = process.env.OLLAMA_MODEL_DEEP || 'gemma3:4b';
+const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS) || 600000;
+const OLLAMA_NUM_CTX = Number(process.env.OLLAMA_NUM_CTX) || 4096;
+const OLLAMA_NUM_CTX_DEEP = Number(process.env.OLLAMA_NUM_CTX_DEEP) || 4096;
+
+const GEMINI_MODEL = 'gemini-3.8-flash';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 120000;
+
+// Quality for the current request ('fast' | 'deep'), set from the request body.
+const requestQuality = new AsyncLocalStorage<{ quality: 'fast' | 'deep' }>();
+
+type LocalContent = { role?: string; parts?: { text?: string }[] };
+
+class GeminiApiError extends Error {
+  status: number;
+  code: string;
+
+  constructor(message: string, status: number, code: string) {
+    super(message);
+    this.name = 'GeminiApiError';
+    this.status = status;
+    this.code = code;
   }
-  return new GoogleGenAI({
-    apiKey: key,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
 }
 
-async function callGeminiWithTimeout<T>(
+// Hosted Gemini client used ONLY by /api/chat/journal.
+// The model is fixed to the free-tier model; no model override is accepted.
+function getGeminiClient() {
+  return {
+    models: {
+      async generateContent(args: {
+        model?: string;
+        contents: string | LocalContent[];
+        config?: { systemInstruction?: string; responseMimeType?: string };
+      }): Promise<{ text: string }> {
+        if (!GEMINI_API_KEY) {
+          throw new GeminiApiError(
+            'GEMINI_API_KEY is missing from the server .env file.',
+            503,
+            'GEMINI_API_KEY_MISSING'
+          );
+        }
+
+        const contents: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+
+        if (typeof args.contents === 'string') {
+          const text = args.contents.trim();
+          if (text) contents.push({ role: 'user', parts: [{ text }] });
+        } else {
+          for (const item of args.contents || []) {
+            const parts = (item.parts || [])
+              .map((part) => typeof part.text === 'string' ? part.text : '')
+              .filter((text) => text.length > 0)
+              .map((text) => ({ text }));
+
+            if (parts.length) {
+              contents.push({
+                role: item.role === 'model' || item.role === 'assistant' ? 'model' : 'user',
+                parts,
+              });
+            }
+          }
+        }
+
+        if (!contents.length) {
+          throw new GeminiApiError('Gemini request contained no message content.', 400, 'EMPTY_CONTENT');
+        }
+
+        const isJson = args.config?.responseMimeType === 'application/json';
+        const thinkingLevel = requestQuality.getStore()?.quality === 'deep' ? 'high' : 'low';
+        const controller = new AbortController();
+        const abortTimer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+
+        try {
+          const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': GEMINI_API_KEY,
+              },
+              signal: controller.signal,
+              body: JSON.stringify({
+                contents,
+                ...(args.config?.systemInstruction
+                  ? { systemInstruction: { parts: [{ text: args.config.systemInstruction }] } }
+                  : {}),
+                generationConfig: {
+                  temperature: 0.65,
+                  topP: 0.9,
+                  // Gemini 3.8 Flash supports low/medium/high thinking levels.
+                  // Deep mode uses high reasoning; Fast mode uses low latency.
+                  thinkingConfig: { thinkingLevel },
+                  // Allow room for internal reasoning plus the short final reply.
+                  maxOutputTokens: isJson ? 2048 : 4096,
+                  ...(isJson ? { responseMimeType: 'application/json' } : {}),
+                },
+              }),
+            }
+          );
+
+          const responseText = await response.text();
+          let data: any = {};
+          try {
+            data = responseText ? JSON.parse(responseText) : {};
+          } catch {
+            throw new GeminiApiError(
+              `Gemini returned an unreadable response (HTTP ${response.status}).`,
+              response.status || 502,
+              'INVALID_API_RESPONSE'
+            );
+          }
+
+          if (!response.ok) {
+            const apiMessage = data?.error?.message || response.statusText || 'Unknown Gemini API error';
+            const quotaError = response.status === 429 ||
+              /RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(apiMessage);
+
+            throw new GeminiApiError(
+              quotaError
+                ? `Gemini Free-tier quota or rate limit reached. No retry or paid fallback was attempted. ${apiMessage}`
+                : `Gemini API error (HTTP ${response.status}): ${apiMessage}`,
+              response.status,
+              quotaError ? 'GEMINI_FREE_QUOTA_EXHAUSTED' : 'GEMINI_API_ERROR'
+            );
+          }
+
+          const responseParts = data?.candidates?.[0]?.content?.parts || [];
+          const text = responseParts
+            .map((part: any) => typeof part.text === 'string' ? part.text : '')
+            .join('')
+            .trim();
+
+          if (!text) {
+            const reason = data?.candidates?.[0]?.finishReason ||
+              data?.promptFeedback?.blockReason || 'empty response';
+            throw new GeminiApiError(`Gemini returned no text: ${reason}`, 502, 'EMPTY_MODEL_RESPONSE');
+          }
+
+          console.info('Gemini completion:', {
+            model: GEMINI_MODEL,
+            promptTokenCount: data?.usageMetadata?.promptTokenCount,
+            outputTokenCount: data?.usageMetadata?.candidatesTokenCount,
+          });
+
+          return { text };
+        } catch (error: any) {
+          if (error?.name === 'AbortError') {
+            throw new GeminiApiError(
+              `Gemini request exceeded ${GEMINI_TIMEOUT_MS}ms and was aborted.`,
+              504,
+              'GEMINI_TIMEOUT'
+            );
+          }
+          throw error;
+        } finally {
+          clearTimeout(abortTimer);
+        }
+      },
+    },
+  };
+}
+
+// Local Ollama client retained for non-journal AI features. These requests
+// continue to run on this computer and do not call the Gemini API.
+function getLocalOllamaClient() {
+  return {
+    models: {
+      async generateContent(args: {
+        model?: string;
+        contents: string | LocalContent[];
+        config?: { systemInstruction?: string; responseMimeType?: string };
+      }): Promise<{ text: string }> {
+        const messages: { role: string; content: string }[] = [];
+        if (args.config?.systemInstruction) {
+          messages.push({ role: 'system', content: args.config.systemInstruction });
+        }
+        if (typeof args.contents === 'string') {
+          messages.push({ role: 'user', content: args.contents });
+        } else {
+          for (const item of args.contents || []) {
+            const text = (item.parts || []).map((part) => part.text || '').join('\n');
+            if (!text) continue;
+            messages.push({ role: item.role === 'model' || item.role === 'assistant' ? 'assistant' : 'user', content: text });
+          }
+        }
+
+        const wantJson = args.config?.responseMimeType === 'application/json';
+        const deep = requestQuality.getStore()?.quality === 'deep';
+        const isPlanner = wantJson;
+        const model = deep ? OLLAMA_MODEL_DEEP : OLLAMA_MODEL;
+        const controller = new AbortController();
+        const abortTimer = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+
+        try {
+          const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              model,
+              messages,
+              stream: false,
+              ...(wantJson ? { format: 'json' } : {}),
+              ...(isPlanner && model === 'qwen3:8b' ? { think: false } : {}),
+              options: {
+                num_ctx: deep ? OLLAMA_NUM_CTX_DEEP : OLLAMA_NUM_CTX,
+                num_predict: isPlanner ? 700 : 500,
+                temperature: 0.65,
+                top_p: 0.9,
+                repeat_penalty: 1.1,
+              },
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`Ollama ${response.status}: ${(await response.text()).slice(0, 200)}`);
+          }
+
+          const data: any = await response.json();
+          console.info('Ollama completion:', {
+            model: data?.model || model,
+            done: data?.done,
+            done_reason: data?.done_reason,
+            prompt_eval_count: data?.prompt_eval_count,
+            eval_count: data?.eval_count,
+          });
+          return { text: data?.message?.content || '' };
+        } catch (error: any) {
+          if (error?.name === 'AbortError') {
+            throw new Error(`Ollama request exceeded ${OLLAMA_TIMEOUT_MS}ms and was aborted`);
+          }
+          throw error;
+        } finally {
+          clearTimeout(abortTimer);
+        }
+      },
+    },
+  };
+}
+
+// Preserve the previous generous timeout behavior for local AI routes.
+async function callAIWithTimeout<T>(
   promise: Promise<T>,
-  timeoutMs: number = 6000
+  _timeoutMs: number = 0
 ): Promise<T> {
   let timer: NodeJS.Timeout;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('Gemini API timeout')), timeoutMs);
+    timer = setTimeout(() => reject(new Error('AI request timed out')), OLLAMA_TIMEOUT_MS);
   });
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
-// Helper for safe JSON parsing from Gemini
+
+// ---------------------------------------------------------------------------
+// Personal context for the local model: a standing profile plus the past sessions
+// most relevant to what the user is writing about right now (keyword retrieval).
+// The client sends its sessions with each request; nothing is stored on the server.
+// ---------------------------------------------------------------------------
+const STOPWORDS = new Set(('the and for that this with was were are but not you your have has had from they them their there what when where which while about into just like been being would could should then than also because really very much more some other can will did does done its our out all any how why who him her she his said say told talk talked felt feel feeling feelings session today week').split(' '));
+
+function tokenize(text: string): string[] {
+  return (String(text || '').toLowerCase().match(/[a-z][a-z']{2,}/g) || [])
+    .filter((w) => !STOPWORDS.has(w))
+    .map((w) => w.replace(/(ing|ed|es|s)$/, ''))
+    .filter((w) => w.length > 2);
+}
+
+type CompactSession = {
+  id: string;
+  sessionNumber?: number;
+  date?: string;
+  focusTheme?: string;
+  summary?: string;
+  keyInsights?: string[];
+  counselorAdvice?: string;
+  themes?: string[];
+  rawNotes?: string;
+};
+
+function pickRelevantSessions(query: string, sessions: CompactSession[], k: number, excludeIds: string[] = []): CompactSession[] {
+  const pool = sessions.filter((s) => !excludeIds.includes(s.id));
+  const q = tokenize(query);
+  if (!q.length || !pool.length) return [];
+  const docs = pool.map((s) => {
+    const text = [s.focusTheme, s.summary, (s.keyInsights || []).join(' '), s.counselorAdvice, (s.themes || []).join(' '), String(s.rawNotes || '').slice(0, 1500)].join(' ');
+    const tokens = tokenize(text);
+    const tf = new Map<string, number>();
+    tokens.forEach((t) => tf.set(t, (tf.get(t) || 0) + 1));
+    return { s, tf, len: tokens.length || 1 };
+  });
+  const df = new Map<string, number>();
+  docs.forEach((d) => d.tf.forEach((_, t) => df.set(t, (df.get(t) || 0) + 1)));
+  const N = docs.length;
+  const scored = docs.map((d, i) => {
+    let score = 0;
+    for (const t of new Set(q)) {
+      const f = d.tf.get(t);
+      if (f) score += (1 + Math.log(f)) * Math.log(1 + N / (df.get(t) || 1));
+    }
+    score = score / Math.sqrt(d.len);
+    score *= 1 + 0.15 * (i / Math.max(1, N - 1)); // gentle recency boost (pool is oldest to newest)
+    return { s: d.s, score };
+  });
+  return scored.filter((x) => x.score > 0).sort((a, b) => b.score - a.score).slice(0, k).map((x) => x.s);
+}
+
+function sessionBlock(s: CompactSession): string {
+  const ins = (s.keyInsights || []).slice(0, 3).join('; ');
+  return `- Session ${s.sessionNumber ?? ''} (${s.date || ''}), ${s.focusTheme || ''}: ${s.summary || ''}${ins ? ` Insights: ${ins}.` : ''}${s.counselorAdvice ? ` Counselor advice: ${s.counselorAdvice}` : ''}`.slice(0, 750);
+}
+
+function buildPersonalContext(opts: { personalProfile?: string; allSessions?: CompactSession[]; query: string; k?: number }): string {
+  const sessions = (Array.isArray(opts.allSessions) ? opts.allSessions : []).slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const latest = sessions[sessions.length - 1];
+  const parts: string[] = [];
+  if (opts.personalProfile) parts.push(`ABOUT THIS PERSON (from their counseling work):\n${String(opts.personalProfile).slice(0, 2800)}`);
+  if (latest) {
+    const related = pickRelevantSessions(opts.query, sessions, opts.k ?? 2, [latest.id]);
+    const blocks = [`Most recent: ${sessionBlock(latest)}`, ...related.map((s) => `Related earlier: ${sessionBlock(s)}`)];
+    parts.push(`SESSION NOTES MOST RELEVANT TO WHAT THEY ARE WRITING ABOUT (use these specifics; never invent session content):\n${blocks.join('\n')}`);
+  }
+  return parts.join('\n\n');
+}
+
+// Status check: Gemini is the hosted provider for journal chat; Ollama remains
+// available for local-only synthesis, resource, and session-prep features.
+app.get('/api/ai/status', async (_req, res) => {
+  try {
+    const r = await fetch(`${OLLAMA_URL}/api/tags`);
+    if (!r.ok) throw new Error(`Ollama status ${r.status}`);
+    const data: any = await r.json();
+    const names: string[] = (data?.models || []).map((m: any) => m.name);
+    const installed = names.some((n) => n === OLLAMA_MODEL || n.split(':')[0] === OLLAMA_MODEL);
+    const has = (m: string) => names.some((n) => n === m || n.split(':')[0] === m);
+    res.json({
+      running: Boolean(GEMINI_API_KEY),
+      provider: 'gemini-free-tier-for-journal',
+      geminiConfigured: Boolean(GEMINI_API_KEY),
+      geminiModel: GEMINI_MODEL,
+      localProvider: 'ollama',
+      ollamaRunning: true,
+      model: OLLAMA_MODEL,
+      modelInstalled: installed,
+      deepModel: OLLAMA_MODEL_DEEP,
+      deepModelInstalled: has(OLLAMA_MODEL_DEEP),
+      installedModels: names,
+    });
+  } catch {
+    res.json({
+      running: Boolean(GEMINI_API_KEY),
+      provider: 'gemini-free-tier-for-journal',
+      geminiConfigured: Boolean(GEMINI_API_KEY),
+      geminiModel: GEMINI_MODEL,
+      localProvider: 'ollama',
+      ollamaRunning: false,
+      model: OLLAMA_MODEL,
+      modelInstalled: false,
+      deepModel: OLLAMA_MODEL_DEEP,
+      deepModelInstalled: false,
+      installedModels: [],
+    });
+  }
+});
+
+// Helper for safe JSON parsing from the local model
 function cleanAndParseJSON(text: string | undefined, fallback: any = {}) {
   if (!text) return fallback;
   try {
@@ -53,44 +408,23 @@ function cleanAndParseJSON(text: string | undefined, fallback: any = {}) {
     }
     return JSON.parse(cleaned);
   } catch (err) {
-    console.warn('Failed to parse JSON response from Gemini:', err);
+    console.warn('Failed to parse JSON response from local AI:', err);
     return fallback;
   }
 }
 
 // -------------------------------------------------------------
-// INTELLIGENT CLINICAL FALLBACK GENERATORS (WHEN GEMINI IS OFFLINE / QUOTA EXCEEDED)
+// INTELLIGENT CLINICAL FALLBACK GENERATORS (WHEN THE LOCAL AI IS OFFLINE)
 // -------------------------------------------------------------
 
 function generateFallbackJournalReply(
-  messages: any[], 
-  sessionContext: any, 
-  mode: string, 
-  activeModalities: string[] = []
+  _messages: any[],
+  _sessionContext: any,
+  _mode: string,
+  _activeModalities: string[] = []
 ): string {
-  const lastMsg = (messages && messages.length > 0 ? messages[messages.length - 1].content : '').trim();
-  const modalities = activeModalities?.length ? activeModalities : ['IFS', 'Somatic Experiencing', 'CBT'];
-  
-  let reflection = `I hear how much is present for you right now. Thank you for taking this moment between sessions to slow down and reflect.\n\n`;
-
-  if (lastMsg) {
-    reflection += `When you bring attention to "${lastMsg.slice(0, 100)}${lastMsg.length > 100 ? '...' : ''}", it is completely understandable that your system feels activated, tired, or tender.\n\n`;
-  }
-
-  if (modalities.includes('Somatic Experiencing')) {
-    reflection += `Let's begin by checking in with your physical body: Where do you feel this sensation most vividly right now? Is there tightness in your chest, a flutter in your stomach, or tension in your jaw or shoulders? Take a slow, compassionate breath and see if you can soften your posture by just 5%.\n\n`;
-  }
-
-  if (modalities.includes('IFS')) {
-    reflection += `From an IFS perspective, notice if there is a protector part speaking—perhaps a vigilant manager trying to keep you safe from being judged, or a critic part that worries about failing. What happens when you extend calm Self-energy and say to that part: "I see you, and I appreciate how hard you have been working to protect me"?\n\n`;
-  } else if (modalities.includes('CBT')) {
-    reflection += `From a CBT lens, what automatic thoughts are running in the background? Are there 'all-or-nothing' assumptions or 'should' statements? Remember that thoughts are mental suggestions, not objective commands.\n\n`;
-  } else if (modalities.includes('DBT')) {
-    reflection += `From a DBT Wise Mind lens, what would balance the emotional surge you are feeling with your grounded inner wisdom?\n\n`;
-  }
-
-  reflection += `What would feel most gentle and supportive for you to give yourself in this moment?`;
-  return reflection;
+  // The hosted journal request is never retried through a paid model or provider.
+  return "I'm having trouble reaching Gemini right now. Your journal entry is still here. No paid fallback was attempted; please try again later.";
 }
 
 function generateFallbackSessionSynthesis(payload: any) {
@@ -424,52 +758,114 @@ function generateFallbackSessionGuide(payload: any) {
 // -------------------------------------------------------------
 
 // 1. CHAT / JOURNALING AGENT ENDPOINT
+
 app.post('/api/chat/journal', async (req, res) => {
   try {
-    const { messages, sessionContext, mode, activeModalities } = req.body;
-    let reply = '';
+    const {
+      messages,
+      sessionContext,
+      mode,
+      activeModalities,
+    } = req.body;
 
-    const gemini = getValidGeminiClient();
+    let reply = '';
+    const gemini = getGeminiClient();
+
     if (gemini) {
       try {
-        const modalitiesList = activeModalities?.length ? activeModalities.join(', ') : 'CBT, Somatic Experiencing, Mindfulness';
+        // Stored profile, archived sessions, and saved homework stay local.
+        // Only the recent journal conversation (formattedContents below) is sent to Gemini.
+        const personalContext = '';
 
-        const systemInstruction = `You are "Soma", a warm, empathetic, and psychologically grounded between-session journaling companion for a user in counseling/therapy.
-Your role:
-- Validate emotional experiences with compassion, warmth, and non-judgment.
-- Active Clinical Modalities leveraged by client: ${modalitiesList}.
-- Tailor reflections using these modalities:
-  * If IFS (Internal Family Systems): recognize "parts" (e.g. protector parts, perfectionist managers, wounded exiles). Gently ask how the client feels toward that part from Self-energy (curiosity, compassion, calm).
-  * If EMDR: normalize noticing bodily anchors, SUDs ratings (0-10), bilateral somatic soothing, and holding dual awareness of past memory vs. present safety.
-  * If CBT: assist with identifying automatic cognitive distortions (catastrophizing, mind-reading, all-or-nothing) and examining objective evidence.
-  * If DBT: reference distress tolerance (TIPP skills, Radical Acceptance), emotion regulation, and Wise Mind balance between emotion and logic.
-  * If Somatic Experiencing / Polyvagal: track bodily felt-senses, window of tolerance, and encourage physical resets (physiological sighs, grounding feet).
-  * If ACT: emphasize psychological flexibility, cognitive defusion ("I notice my mind having the thought that..."), and values-aligned action.
-- Keep responses conversational, concise (2-4 paragraphs maximum), and invite gentle self-exploration.
-- Help the user connect their daily moments to their therapy session themes and homework without sounding clinical or didactic.
-- Safety: If the user indicates immediate severe crisis or intent of self-harm, validate their pain empathetically and remind them of the 988 Suicide & Crisis Lifeline (call/text 988) or text HOME to 741741, while keeping them safe.
+        const systemInstruction = `You are SOMA, a thoughtful, warm, grounded conversational companion for someone engaged in counseling. You are not their therapist.
 
-Current User Context:
-- Active Themes: ${sessionContext?.themes?.join(', ') || 'General growth and emotional well-being'}
-- Recent Session Notes / Focus: ${sessionContext?.recentNotes || 'Working on self-awareness and regulation'}
-- Active Homework: ${sessionContext?.activeHomework?.join('; ') || 'Practicing mindful reflection'}
-- Journaling Mode: ${mode || 'Open reflection'}
-- Active Modalities: ${modalitiesList}
-`;
+YOUR PURPOSE
+Help the user understand their experiences, thoughts, emotions, needs, and patterns. Be a genuine conversational partner, not a therapy instructor or self-help article generator.
 
-        const formattedContents = (messages || []).map((m: { role: string; content: string }) => ({
-          role: m.role === 'model' || m.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: m.content }],
-        }));
+HOW TO CONVERSE
+- Respond to what the user actually says and asks.
+- Explore before intervening. Do not assume every difficulty needs an exercise.
+- Answer direct questions directly.
+- Offer meaningful observations rather than merely paraphrasing.
+- Use natural, everyday language. Avoid headings, numbered lists, and checklists in ordinary conversation.
+- Avoid stock openings and repetitive validation.
+- Use therapeutic ideas only when genuinely relevant.
+- Ask at most one focused question. Do not end every response with a question.
+- Usually respond in 70-130 words.
+- Do not reinforce perfectionism or over-responsibility with more rules.
+
+IMPORTANT DISTINCTIONS
+- Being considerate does not mean being responsible for everyone's feelings.
+- Expressing a need does not automatically make someone selfish.
+- Someone else's disappointment does not automatically mean the user did something wrong.
+- Assertiveness does not require perfect wording or a mutually beneficial outcome.
+
+REASONING STANDARD
+When the user asks to understand a pattern or explore possible explanations:
+
+- Start with the specific behavior the user described. Don't immediately assign it a psychological label.
+- Look for different mechanisms that could independently produce that behavior.
+- Consider ordinary explanations involving attention, decision-making, habits, expectations, values, incentives, and practical circumstances.
+- For each explanation, describe HOW the mechanism could produce the behavior. A label such as perfectionism, people-pleasing, or empathy is not an explanation.
+- Make explanations genuinely distinct. Different descriptions of the same underlying process do not count.
+- Examine what each explanation accounts for and what it does not establish.
+- Distinguish observations from hypotheses. Do not invent motives, memories, or causes.
+- Do not default to childhood, trauma, attachment, approval, fear of conflict, rejection, or emotional responsibility.
+- Do not force a predetermined number of explanations.
+- Do not finish by asking the user which explanation resonates. Contribute your reasoning and allow the conversation to continue naturally.
+
+ILLUSTRATIVE EXAMPLE
+
+User: "I often agree to plans and then wish I hadn't. Why might I do that?"
+
+Good response:
+"Several different processes could produce that pattern. You might be making decisions with an inaccurate forecast of your future energy: how you'll feel later is harder to judge than how you feel now. Another possibility is that you recognize the value of having a free evening but give the immediate appeal of the invitation more weight when deciding. Or accepting might simply be your default response because it ends the decision quickly, before you've really compared the alternatives.
+
+These are different possibilities: one involves forecasting, another involves how you weigh competing preferences, and another involves the decision process itself. Regretting the decision afterward doesn't tell us which one is operating."
+
+WHY THIS EXAMPLE IS USEFUL
+- It explains mechanisms rather than assigning labels.
+- It distinguishes three different processes.
+- It doesn't invent a childhood cause or hidden emotional motive.
+- It acknowledges uncertainty without becoming vague.
+- It contributes an observation without requiring the user to answer a question.
+
+Keep ordinary responses conversational and concise. Do not turn every response into a list of hypotheses. Use this reasoning approach when the user's request calls for it.
+PERSONAL CONTEXT
+This hosted request does not receive the user's stored profile, archived counseling notes, session history, or saved homework. Base your response only on the recent conversation included in the request. Never invent memories, events, or counselor statements.
+
+PACING AND CARE
+Respect uncertainty. Do not push for childhood memories, emotional breakthroughs, body exercises, or therapeutic frameworks. Do not diagnose or provide medical advice. If the user expresses immediate danger or intent to self-harm, respond compassionately, encourage emergency help when appropriate, and provide the US 988 Suicide & Crisis Lifeline.
+
+CURRENT CONTEXT
+Do not use archived counseling notes, stored profile data, or saved session history in this request. Only use the recent journal conversation supplied below.
+Journaling mode: ${mode || 'Open reflection'}
+
+${personalContext}
+
+      CONTEXT RULES
+- Do not imply access to background information that was not included in this request.
+- Never invent memories, motives, experiences, or physical sensations.
+- Prior corrections present in the conversation take precedence over earlier interpretations.
+      `;
+
+        const formattedContents = (messages || [])
+          .slice(-8)
+          .map((m: { role: string; content: string }) => ({
+            role: m.role === 'model' || m.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: m.content }],
+          }));
 
         if (formattedContents.length === 0) {
           formattedContents.push({
             role: 'user',
-            parts: [{ text: "Hello, I'm ready to reflect on how I've been doing since my last session." }],
+            parts: [{
+              text: "Hello, I'm ready to reflect on how I've been doing since my last session.",
+            }],
           });
         }
 
-        const response = await callGeminiWithTimeout(
+        const response = await callAIWithTimeout(
           gemini.models.generateContent({
             model: 'gemini-3.8-flash',
             contents: formattedContents,
@@ -477,27 +873,51 @@ Current User Context:
               systemInstruction,
             },
           }),
-          5000
+          OLLAMA_TIMEOUT_MS
         );
 
         reply = response.text || '';
-      } catch (geminiError) {
-        console.warn('Gemini chat error, using therapeutic fallback:', geminiError);
+      } catch (aiError: any) {
+        console.warn('Gemini journal request failed:', aiError?.message || aiError);
+        const quotaReached = aiError instanceof GeminiApiError && aiError.code === 'GEMINI_FREE_QUOTA_EXHAUSTED';
+        const missingKey = aiError instanceof GeminiApiError && aiError.code === 'GEMINI_API_KEY_MISSING';
+        const replyMessage = quotaReached
+          ? 'Gemini’s free-tier quota or rate limit has been reached. No paid request, retry, or provider switch was made. Please try again after the quota resets.'
+          : missingKey
+            ? 'Gemini is not configured. Check GEMINI_API_KEY in the server .env file. No paid request was made.'
+            : 'Gemini is temporarily unavailable. No paid fallback or provider switch was attempted. Please try again later.';
+        // JournalCompanion currently displays data.reply only when response.ok is true.
+        // Keep HTTP 200 here so the user sees the explicit quota/error explanation.
+        return res.status(200).json({
+          error: quotaReached ? 'GEMINI_FREE_QUOTA_EXHAUSTED' : missingKey ? 'GEMINI_API_KEY_MISSING' : 'GEMINI_UNAVAILABLE',
+          reply: replyMessage,
+        });
       }
     }
 
     if (!reply) {
-      reply = generateFallbackJournalReply(messages, sessionContext, mode, activeModalities);
+      reply = generateFallbackJournalReply(
+        messages,
+        sessionContext,
+        mode,
+        activeModalities
+      );
     }
 
     res.json({ reply });
   } catch (error: any) {
     console.error('Error in journal chat endpoint:', error);
     res.json({
-      reply: generateFallbackJournalReply(req.body?.messages, req.body?.sessionContext, req.body?.mode, req.body?.activeModalities),
+      reply: generateFallbackJournalReply(
+        req.body?.messages,
+        req.body?.sessionContext,
+        req.body?.mode,
+        req.body?.activeModalities
+      ),
     });
   }
 });
+
 
 // 2. SYNTHESIZE SESSION NOTES & RESOURCES INTO MICRO-LEARNING & HOMEWORK
 app.post('/api/synthesize/session', async (req, res) => {
@@ -505,7 +925,7 @@ app.post('/api/synthesize/session', async (req, res) => {
     const { sessionTitle, sessionDate, rawNotes, themes, resourcesText, counselorAdvice } = req.body;
     let data: any = null;
 
-    const gemini = getValidGeminiClient();
+    const gemini = getLocalOllamaClient();
     if (gemini) {
       try {
         const prompt = `You are a clinical synthesis assistant helping a counseling client turn their therapy session notes into practical, bite-sized between-session micro-learning and actionable homework.
@@ -553,7 +973,7 @@ Please synthesize this into a structured JSON object with the following structur
 
 Return ONLY valid JSON.`;
 
-        const response = await callGeminiWithTimeout(
+        const response = await callAIWithTimeout(
           gemini.models.generateContent({
             model: 'gemini-3.8-flash',
             contents: prompt,
@@ -566,7 +986,7 @@ Return ONLY valid JSON.`;
 
         data = cleanAndParseJSON(response.text, null);
       } catch (geminiError) {
-        console.warn('Gemini session synthesis error, using fallback:', geminiError);
+        console.warn('Local Ollama session synthesis error, using fallback:', geminiError);
       }
     }
 
@@ -587,7 +1007,7 @@ app.post('/api/synthesize/resource', async (req, res) => {
     const { title, type, url, authorOrCreator, notes, relatedTheme } = req.body;
     let data: any = null;
 
-    const gemini = getValidGeminiClient();
+    const gemini = getLocalOllamaClient();
     if (gemini) {
       try {
         const prompt = `You are an expert therapy learning synthesizer. A counseling client was recommended or assigned a resource by their therapist or found a helpful resource to support their growth between sessions.
@@ -616,7 +1036,7 @@ Return a JSON object:
 
 Return ONLY valid JSON.`;
 
-        const response = await callGeminiWithTimeout(
+        const response = await callAIWithTimeout(
           gemini.models.generateContent({
             model: 'gemini-3.8-flash',
             contents: prompt,
@@ -629,7 +1049,7 @@ Return ONLY valid JSON.`;
 
         data = cleanAndParseJSON(response.text, null);
       } catch (geminiError) {
-        console.warn('Gemini resource synthesis error, using fallback:', geminiError);
+        console.warn('Local Ollama resource synthesis error, using fallback:', geminiError);
       }
     }
 
@@ -644,13 +1064,58 @@ Return ONLY valid JSON.`;
   }
 });
 
+// 3b. WEEKLY FOCUS BASED ON RECENT SESSIONS
+app.post('/api/generate/weekly-focus', async (req, res) => {
+  try {
+    const { sessions, pillars, counselorName, sessionId, personalProfile, allSessions } = req.body || {};
+    const gemini = getLocalOllamaClient();
+    if (!gemini) return res.status(503).json({ error: 'AI unavailable' });
+    const recent = (Array.isArray(sessions) ? sessions : []).slice(0, 2).map((s: any) =>
+      `Session ${s.date} (${s.focusTheme}):\n${String(s.rawNotes || '').slice(0, 2500)}`
+    ).join('\n\n---\n\n');
+    const prompt = `You are a supportive between-session companion. A client sees counselor ${counselorName || 'their counselor'}. Their counseling pillars: ${(pillars || []).join('; ')}.
+${buildPersonalContext({ personalProfile, allSessions, query: String((sessions && sessions[0] && (sessions[0].focusTheme + ' ' + sessions[0].summary)) || ''), k: 2 })}
+
+Based mainly on their MOST RECENT session (first below) and the pattern across the earlier ones, write what they should work on and explore this week. Speak to the client as "you". Do not diagnose or give medical advice, and stay consistent with what the counselor actually said.
+
+${recent}
+
+Return ONLY JSON:
+{
+  "summary": "3-4 sentence summary of where they are and the focus this week",
+  "focusAreas": [{"title": "...", "why": "..."}],
+  "practices": ["5 concrete small practices"],
+  "journalPrompts": ["6 journal prompts"],
+  "affirmations": ["5 first-person affirmations in the client's own voice"],
+  "resources": [{"title": "...", "author": "...", "why": "...", "fromCounselor": false}]
+}
+Use exactly 3 focusAreas and 3-4 real, well-known resources only (never invent titles). Set fromCounselor true only for resources the counselor named in the notes.`;
+    const response = await callAIWithTimeout(
+      gemini.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: prompt,
+        config: { responseMimeType: 'application/json' },
+      }),
+      20000
+    );
+    const data = cleanAndParseJSON(response.text, null);
+    if (!data || !data.summary || !Array.isArray(data.journalPrompts)) {
+      return res.status(502).json({ error: 'Bad AI response' });
+    }
+    res.json({ ...data, sessionId, source: 'ai' });
+  } catch (error: any) {
+    console.warn('Local Ollama weekly focus error:', error?.message || error);
+    res.status(502).json({ error: 'AI unavailable' });
+  }
+});
+
 // 4. GENERATE ON-DEMAND MICRO-LESSON / QUIZ FOR A THEME
 app.post('/api/generate/micro-lesson', async (req, res) => {
   try {
     const { theme, clientNeeds } = req.body;
     let data: any = null;
 
-    const gemini = getValidGeminiClient();
+    const gemini = getLocalOllamaClient();
     if (gemini) {
       try {
         const prompt = `Create a high-impact, 2-minute therapy micro-learning card and interactive quiz challenge for a counseling client working on: "${theme || 'Emotional Regulation and Resilience'}".
@@ -678,7 +1143,7 @@ Return a JSON object:
 
 Return ONLY valid JSON.`;
 
-        const response = await callGeminiWithTimeout(
+        const response = await callAIWithTimeout(
           gemini.models.generateContent({
             model: 'gemini-3.8-flash',
             contents: prompt,
@@ -691,7 +1156,7 @@ Return ONLY valid JSON.`;
 
         data = cleanAndParseJSON(response.text, null);
       } catch (geminiError) {
-        console.warn('Gemini micro-lesson error, using fallback:', geminiError);
+        console.warn('Local Ollama micro-lesson error, using fallback:', geminiError);
       }
     }
 
@@ -712,7 +1177,7 @@ app.post('/api/report/session-prep', async (req, res) => {
     const { recentSessions, completedHomework, pendingHomework, journalHighlights, themes } = req.body;
     let data: any = null;
 
-    const gemini = getValidGeminiClient();
+    const gemini = getLocalOllamaClient();
     if (gemini) {
       try {
         const prompt = `You are a clinical assistant helping a counseling client prepare an empowering, structured 1-page summary to bring to their NEXT therapy session.
@@ -747,7 +1212,7 @@ Return a JSON object:
 
 Return ONLY valid JSON.`;
 
-        const response = await callGeminiWithTimeout(
+        const response = await callAIWithTimeout(
           gemini.models.generateContent({
             model: 'gemini-3.8-flash',
             contents: prompt,
@@ -760,7 +1225,7 @@ Return ONLY valid JSON.`;
 
         data = cleanAndParseJSON(response.text, null);
       } catch (geminiError) {
-        console.warn('Gemini session prep report error, using fallback:', geminiError);
+        console.warn('Local Ollama session prep report error, using fallback:', geminiError);
       }
     }
 
@@ -790,7 +1255,7 @@ app.post('/api/generate/session-guide', async (req, res) => {
 
     let guideData: any = null;
 
-    const gemini = getValidGeminiClient();
+    const gemini = getLocalOllamaClient();
     if (gemini) {
       try {
         const modalitiesList = (activeModalities && activeModalities.length > 0)
@@ -861,7 +1326,7 @@ Please synthesize this into a structured JSON Next Session Guide:
 
 Return ONLY valid JSON.`;
 
-        const response = await callGeminiWithTimeout(
+        const response = await callAIWithTimeout(
           gemini.models.generateContent({
             model: 'gemini-3.8-flash',
             contents: prompt,
@@ -874,7 +1339,7 @@ Return ONLY valid JSON.`;
 
         guideData = cleanAndParseJSON(response.text, null);
       } catch (geminiError) {
-        console.warn('Gemini session guide generation error, using fallback:', geminiError);
+        console.warn('Local Ollama session guide generation error, using fallback:', geminiError);
       }
     }
 
