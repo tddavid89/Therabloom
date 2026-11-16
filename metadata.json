@@ -1,6 +1,0 @@
-{
-  "name": "TheraBloom: Between-Session Counseling & Growth Companion",
-  "description": "Track counseling progress, synthesize session notes into gamified micro-learning, manage therapy homework and multimedia resources, and reflect with an AI journaling companion.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
